@@ -1,7 +1,8 @@
 # BB-8 Inspired ESP32 Robot 🤖
 
-Autonomous robot inspired by **BB-8** from *Star Wars*.  
-Built with **ESP32**, **VL53L0X** distance sensor, and **NeoPixel (WS2812)** LEDs for motion, obstacle detection, and visual feedback.
+In the new version of the project, the previous single-ESP32 architecture has been completely replaced. The system now uses two ESP32 modules communicating via ESP-NOW, which significantly improves reliability, simplifies wiring, and allows the physical separation of system functions.
+
+**System Split Into Two ESP32 Modules**
 
 Developed in **PlatformIO** using the **Arduino framework**.
 
@@ -9,161 +10,228 @@ Developed in **PlatformIO** using the **Arduino framework**.
 
 ## Features ✨
 
-### Motion Control
-- Dual DC motors controlled via ESP32 GPIO:
-  - IN1 – GPIO 5
-  - IN2 – GPIO 18
-  - IN3 – GPIO 16
-  - IN4 – GPIO 17
-- Moves forward when path is clear.
-- Changes direction to avoid obstacles (<200 mm).
+### 1. ESP32 “LED + Sensor” – located in the head
 
-### Obstacle Detection
-- VL53L0X Time-of-Flight sensor.
-- Distance range: 30–2000 mm.
-- Timeout prints `Sensor timeout!` in Serial Monitor.
+This module is responsible for:
 
-### LED Feedback (NeoPixel WS2812)
-Two LED rings provide visual status:
+- measuring the distance using the VL53L0X sensor,
 
-| System State | Condition | LED Color (GRB) | Meaning |
-|--------------|-----------|-----------------|---------|
-| 🔵 Blue | Startup | (0, 0, 255) | System ready / initialization |
-| 🟢 Green | Distance ≥ 200 mm | (0, 255, 0) | Path clear – moving forward |
-| 🔴 Red | Distance < 200 mm | (255, 0, 0) | Obstacle detected – avoidance |
+- controlling the NeoPixel LED ring inside the head (changing color depending on distance),
 
-> **Note:** WS2812 LEDs use **GRB** color order, not RGB. Colors in the code are adjusted accordingly.
+- transmitting the measured distance to the second ESP32.
 
----
+It acts as the transmitter, sending a **DistanceData** structure with the distance value.
 
-## How It Works ⚙️
-
-1. **Setup**
-   - Starts serial communication (`Serial.begin(9600)`).
-   - Configures motor pins as outputs.
-   - Initializes I²C (SDA = GPIO 21, SCL = GPIO 22).
-   - Initializes VL53L0X sensor (timeout = 500 ms).
-   - Initializes NeoPixel LEDs and sets them to **blue**.
-   - Prints `System Ready!` to Serial Monitor.
-
-2. **Loop**
-   - Reads distance from the sensor.
-   - If timeout → prints `Sensor timeout!` and skips loop.
-   - If distance < 200 mm:
-     - Motors change direction (avoidance).
-     - LEDs turn **red**.
-   - If distance ≥ 200 mm:
-     - Robot moves forward.
-     - LEDs turn **green**.
-   - Loop delay: 100 ms.
-
----
-
-## Code Structure 📂
-
-### `main.cpp`
+This behavior is implemented in:
+### `main_led_esp.cpp`
 
 ```cpp
-#include <Arduino.h> 
+#include <Arduino.h>
 #include <Wire.h>
 #include <VL53L0X.h>
-#include <Adafruit_NeoPixel.h>
-
-#define IN1 5 
-#define IN2 18 
-#define IN3 16
-#define IN4 17 
+#include <adafruit_neopixel.h>
+#include <esp_now.h>
+#include <WiFi.h>
 
 #define LED_PIN 4
-#define LED_COUNT 16
-
-#define LED_PIN2 2
-#define LED_COUNT2 12
+#define LED_COUNT 12
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_RGB + NEO_KHZ800);
-Adafruit_NeoPixel strip2(LED_COUNT2, LED_PIN2, NEO_RGB + NEO_KHZ800);
 
 VL53L0X sensor;
 
-void setColor(uint8_t r, uint8_t g, uint8_t b) {
-  for (int i = 0; i < LED_COUNT; i++) {
-    strip.setPixelColor(i, strip.Color(r, g, b));
-  }
+uint8_t receiverAddress[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // <-- ESP32 Mac addres
+
+struct DistanceData {
+  uint16_t distance;
+};
+
+DistanceData dataToSend;
+
+void setColor(uint8_t r, uint8_t g, uint8_t b){
+  for (int i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, strip.Color(r, g, b));
   strip.show();
 }
 
-void setColor2(uint8_t r, uint8_t g, uint8_t b) {
-  for (int i = 0; i < LED_COUNT2; i++) {
-    strip2.setPixelColor(i, strip2.Color(r, g, b));
+void onSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Wysyłam Dane: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "BŁĄD");
+}
+
+
+void setup(){
+  Serial.begin(9600);
+  Wire.begin(21, 22);
+
+  strip.begin(); strip.show();
+
+  setColor(0, 0, 255);
+
+  if(!sensor.init()){
+    Serial.println("Błąd inicjalizacji czujnika!");
+    while(1);
   }
-  strip2.show();
+  sensor.setTimeout(500);
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Błąd inicjalizacji ESP-NOW");
+    while (true);
+  }
+
+  esp_now_register_send_cb(onSent);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Błąd dodawania odbiorcy");
+    return;
+  }
+
+  Serial.println("System Gotowy!");
+
 }
 
-void setup(){ 
 
-Serial.begin(9600);
+void loop() {
 
-pinMode(IN1, OUTPUT); 
-pinMode(IN2, OUTPUT); 
-pinMode(IN3, OUTPUT); 
-pinMode(IN4, OUTPUT);
+  uint16_t distance = sensor.readRangeSingleMillimeters();
 
-digitalWrite(IN1, HIGH); 
-digitalWrite(IN2, HIGH);
-digitalWrite(IN3, HIGH); 
-digitalWrite(IN4, HIGH);
+  if (sensor.timeoutOccurred()) {
+    Serial.println("Sensor timeout!");
+    delay(500);
+    return;
+  }
 
-Wire.begin(21, 22);
+  Serial.printf("Odległość: %d mm\n", distance);
+  dataToSend.distance = distance;
 
-if(!sensor.init()){
-    Serial.println("Failed to detect and initialize sensor!");
-    while(1);  
+  esp_now_send(receiverAddress, (uint8_t *)&dataToSend, sizeof(dataToSend));
+
+  if (distance < 200) {
+    setColor(255, 0, 0);
+  } else {
+    setColor(0, 0, 255);
+  }
+
+  delay(500);   
 }
 
-sensor.setTimeout(500);
+```
+The module:
 
-  strip.begin();
-  strip.show();
-  strip2.begin();
-  strip2.show();
+  - reads the current distance,
+
+  - updates the LED color (red <200 mm, blue >200 mm),
+
+  - sends the data to the ESP32 located inside the large sphere.
+
+### 2. ESP32 “Motor Controller” – located in the main large sphere
+
+The second ESP32 receives the distance data sent from the head and controls the motors based on the received value.
+
+This is implemented in:
+
+### `main_moto.cpp`
+
+```cpp
+#include <Arduino.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+#define IN1 5
+#define IN2 18
+#define IN3 19
+#define IN4 21
 
 
-setColor(0, 0, 255);
-setColor2(0, 0, 255);
+struct DistanceData {
+  uint16_t distance;
+};
 
-Serial.println("System Gototwy!");
+DistanceData receivedData;
 
-} 
 
-void loop(){ 
-    uint16_t distance = sensor.readRangeSingleMillimeters();
+uint8_t senderAddress[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // <-- ESP_Led Mac address
 
-    if(sensor.timeoutOccurred()){
-        Serial.println("Sensor timeout!");
-        return;
-    } 
+void onReceive(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  memcpy(&receivedData, incomingData, sizeof(receivedData));
+  Serial.printf("Odebrano odległość: %d mm\n", receivedData.distance);
 
-    Serial.printf("Odległość: %d mm\n", distance);
-    
-if (distance <200){
+  if (receivedData.distance < 200) {
     digitalWrite(IN1, HIGH);
     digitalWrite(IN2, LOW);
     digitalWrite(IN3, LOW);
     digitalWrite(IN4, LOW);
-
-    setColor(0, 255, 0); 
-    setColor2(0, 255, 0); 
-
-} else {
+  } else {
     digitalWrite(IN1, HIGH);
     digitalWrite(IN2, LOW);
     digitalWrite(IN3, HIGH);
     digitalWrite(IN4, LOW);
-
-    setColor(0, 0, 0);
-    setColor2(0, 255, 0);  
+  }
 }
 
-delay(100);
-}   
+void setup() {
+  Serial.begin(9600);
 
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Błąd inicjalizacji ESP-NOW");
+    return;
+  }
+
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, senderAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Błąd dodawania PEER");
+    return;
+  }
+
+  esp_now_register_recv_cb(onReceive);
+
+  Serial.println("ESP32 MOTOR – gotowy do odbioru!");
+}
+
+void loop() {
+  delay(100);
+}
+
+```
+
+**Responsibilities:**
+
+  - receiving ESP-NOW packets,
+
+  - reading the distance value,
+
+  - controlling motor direction using pins IN1–IN4.
+
+**Logic example:**
+If the distance < 200 mm → specific motor reaction (e.g., stop or avoidance).
+If ≥ 200 mm → motors operate normally.
+
+
+**Benefits of the Updated Architecture**
+
+  - no need for long wires between the head and the sphere,
+
+  - LEDs and sensor in the head work independently,
+
+  - the motor controller stays isolated from LED/sensor noise,
+
+  - modular design simplifies maintenance and upgrades,
+
+  - ESP-NOW ensures fast and stable wireless communication.
